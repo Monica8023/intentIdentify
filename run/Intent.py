@@ -113,9 +113,7 @@ class IntentResponse(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     logger.info("[启动] 正在初始化 Nacos 配置...")
-    coro = NacosConfig.init_config()
-    if coro is not None:  # NACOS_DISABLED=true 时返回 None，直接跳过
-        await coro
+    await NacosConfig.init_config()
     logger.info("[启动] 正在初始化 HyBridSearch 组件（模型 + Milvus + 批处理器 + 重排器）...")
     HyBridSearch.init_components()
     logger.info("[启动] 所有组件初始化完成，服务就绪")
