@@ -17,7 +17,6 @@ Intent — AI 意图识别微服务（唯一服务入口）
 
 import asyncio
 import csv
-import hashlib
 import io
 import logging
 import os
@@ -95,17 +94,17 @@ singleflight = SingleFlight()
 # --- 请求与响应模型 ---
 class IntentRequest(BaseModel):
     text: str
-    call_id: Optional[str] = Field(default=None, alias="callId")
+    call_id: str
 
-    @validator('call_id')
-    def call_id_must_not_be_empty(cls, v):
-        if not v:
-            raise ValueError('call_id不能为空')
+    # @validator('call_id')
+    # def call_id_must_not_be_empty(cls, v):
+    #     if not v:
+    #         raise ValueError('call_id不能为空')
 
 
 class IntentResponse(BaseModel):
     intent_id: str
-    call_id: Optional[str] = Field(default=None, alias="callId")
+    call_id: Optional[str] = Field(default=None)
 
 
 # ================= 生命周期管理 =================
@@ -623,6 +622,29 @@ async def compare_data(req: CompareRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"混合检索+重排失败: {str(e)}")
 
+class InterruptRequest(BaseModel):
+    call_id: int
+
+
+class CallbackRequest(BaseModel):
+    call_id: int
+    intent_id: Optional[str] = None
+    uuid: Optional[int] = None
+    event: Optional[str] = None
+    timestamp: Optional[int] = None
+    transcript: Optional[str] = None
+
+
+@app.post("/interrupt")
+async def interrupt(req: InterruptRequest):
+    logger.info(f"这是打断请求 : {req}")
+
+
+@app.post("/callback")
+async def callback(req: CallbackRequest):
+    logger.info(f"回调事件: {req.event} 回调请求 : {req}")
+
+
 
 # ================= 意图识别（生产接口）=================
 
@@ -706,7 +728,7 @@ async def fetch_intent_from_vector_db(text: str, cache_key: str) -> str:
     # 写入缓存（后台，不阻塞返回）
     asyncio.ensure_future(set_cache_background(cache_key, intent_id))
 
-    return intent_id
+    return str(intent_id)
 
 
 # --- 异步缓存写入 ---
@@ -721,6 +743,7 @@ async def recognize_intent(request: IntentRequest):
     clean_text = re.sub(r'<[^>]+>', '', request.text)
     clean_text = re.sub(r'[^\w\s\u4e00-\u9fa5,.?!，。？！]', '', clean_text)
     clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    logger.info(f"request: {request}")
 
     if not clean_text:
         raise HTTPException(status_code=400, detail="Text is empty after preprocessing.")
@@ -747,7 +770,7 @@ async def recognize_intent(request: IntentRequest):
         except Exception as e:
             logger.error(f"[Error] 向量检索失败: {e}")
             intent_id = "intent_unknown"
-
+    logger.info(f"callId : {request.call_id}")
     return IntentResponse(
         intent_id=intent_id,
         call_id=request.call_id
