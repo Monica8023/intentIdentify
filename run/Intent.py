@@ -726,7 +726,7 @@ async def fetch_intent_from_vector_db(text: str, cache_key: str) -> str:
     )
 
     # 写入缓存（后台，不阻塞返回）
-    asyncio.ensure_future(set_cache_background(cache_key, intent_id))
+    # asyncio.ensure_future(set_cache_background(cache_key, intent_id))
 
     return str(intent_id)
 
@@ -752,6 +752,8 @@ async def recognize_intent(request: IntentRequest):
         raise HTTPException(status_code=400, detail="Text exceeds maximum length limit.")
     current_node_key = f"dolphin:current:node:{request.call_id}"  # 查询当前call_id对应的节点
     current_node_id = await redis_client.get(current_node_key)
+    if not current_node_id:
+        raise HTTPException(status_code=400, detail="current  callId have not been set node id")
     logger.info(f"当前节点id:{current_node_id}  查询key:{current_node_key}")
 
     # 根据当前节点id查询热键  命中直接返回 未命中走向量匹配
@@ -770,7 +772,7 @@ async def recognize_intent(request: IntentRequest):
         except Exception as e:
             logger.error(f"[Error] 向量检索失败: {e}")
             intent_id = "intent_unknown"
-    logger.info(f"callId : {request.call_id}")
+    logger.info(f"callId : {request.call_id} intentId : {intent_id}")
     return IntentResponse(
         intent_id=intent_id,
         call_id=request.call_id
