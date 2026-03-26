@@ -95,11 +95,8 @@ singleflight = SingleFlight()
 class IntentRequest(BaseModel):
     text: str
     call_id: str
-
-    # @validator('call_id')
-    # def call_id_must_not_be_empty(cls, v):
-    #     if not v:
-    #         raise ValueError('call_id不能为空')
+    model_id: int
+    type_threshold: int
 
 
 class IntentResponse(BaseModel):
@@ -152,10 +149,11 @@ async def insert_data(req: BatchInsertRequest):
         model_ids = [item.model_id for item in items]
         intent_ids = [item.intent_id for item in items]
         text_list = [item.text for item in items]
+        types = [item.type for item in items]
         is_actives = [item.active for item in items]
         dense_vecs = [encoded['dense_vecs'][j].tolist() for j in range(len(items))]
         sparse_vecs = [encoded['lexical_weights'][j] for j in range(len(items))]
-        entities = [model_ids, intent_ids, text_list, is_actives, dense_vecs, sparse_vecs]
+        entities = [model_ids, intent_ids, text_list, types, is_actives, dense_vecs, sparse_vecs]
         logger.info(f"[新增] 新增数据{entities}")
         res = HyBridSearch.collection.insert(entities)
         total_cost = (time.perf_counter() - total_start) * 1000
@@ -186,7 +184,7 @@ async def delete_data(req: DeleteRequest):
 
             query_results = HyBridSearch.collection.query(
                 expr=expr,
-                output_fields=["id", "model_id", "intent_id", "text", "dense_vector", "sparse_vector"],
+                output_fields=["id", "model_id", "intent_id", "text", "type", "dense_vector", "sparse_vector"],
                 limit=16384
             )
 
@@ -201,12 +199,13 @@ async def delete_data(req: DeleteRequest):
             ins_models = [r["model_id"] for r in query_results]
             ins_intents = [r["intent_id"] for r in query_results]
             ins_texts = [r["text"] for r in query_results]
+            ins_types = [r["type"] for r in query_results]
             ins_actives = [False] * len(query_results)
             ins_dense = [r["dense_vector"] for r in query_results]
             ins_sparse = [r["sparse_vector"] for r in query_results]
 
             HyBridSearch.collection.insert([
-                ins_models, ins_intents, ins_texts, ins_actives, ins_dense, ins_sparse
+                ins_models, ins_intents, ins_texts, ins_types, ins_actives, ins_dense, ins_sparse
             ])
             deleted_count += len(query_results)
 
@@ -254,7 +253,7 @@ async def update_data(req: BatchUpdateRequest):
                 expr = f'intent_id == "{item.intent_id}" and is_active == true and model_id == {item.model_id}'
                 qs = HyBridSearch.collection.query(
                     expr=expr,
-                    output_fields=["id", "model_id", "intent_id", "text", "dense_vector", "sparse_vector"],
+                    output_fields=["id", "model_id", "intent_id", "text", "type", "dense_vector", "sparse_vector"],
                     limit=16384
                 )
                 if qs:
@@ -266,12 +265,13 @@ async def update_data(req: BatchUpdateRequest):
                     ins_models = [r["model_id"] for r in qs]
                     ins_intents = [r["intent_id"] for r in qs]
                     ins_texts = [r["text"] for r in qs]
+                    ins_types = [r["type"] for r in qs]
                     ins_actives = [False] * len(qs)
                     ins_dense = [r["dense_vector"] for r in qs]
                     ins_sparse = [r["sparse_vector"] for r in qs]
 
                     HyBridSearch.collection.insert([
-                        ins_models, ins_intents, ins_texts, ins_actives, ins_dense, ins_sparse
+                        ins_models, ins_intents, ins_texts, ins_types, ins_actives, ins_dense, ins_sparse
                     ])
 
                     item_result["deleted"] = len(qs)
@@ -288,11 +288,12 @@ async def update_data(req: BatchUpdateRequest):
                 model_ids = [item.model_id] * n
                 intent_ids = [item.intent_id] * n
                 text_list = list(item.texts)
+                types = [item.type] * n
                 is_actives = [item.active] * n
                 dense_vecs = [encoded['dense_vecs'][j].tolist() for j in range(n)]
                 sparse_vecs = [encoded['lexical_weights'][j] for j in range(n)]
 
-                entities = [model_ids, intent_ids, text_list, is_actives, dense_vecs, sparse_vecs]
+                entities = [model_ids, intent_ids, text_list, types, is_actives, dense_vecs, sparse_vecs]
                 res = HyBridSearch.collection.insert(entities)
 
                 item_result["inserted"] = len(res.primary_keys)
@@ -350,7 +351,7 @@ async def upload_csv(file: UploadFile = File(...)):
         reader = csv.DictReader(io.StringIO(text_content))
 
         # 校验表头
-        required_fields = {'intent_id', 'text'}
+        required_fields = {'intent_id', 'text', 'model_id'}
         if not required_fields.issubset(set(reader.fieldnames or [])):
             raise HTTPException(
                 status_code=400,
@@ -362,10 +363,16 @@ async def upload_csv(file: UploadFile = File(...)):
         for row in reader:
             text = (row.get('text') or '').strip()
             if text:
+                # model_id 必填，这里已在表头校验，且如果数据行中没有，强行转会报错或取默认值
+                # 为了健壮性，如果为空可以抛错，或者转为int
+                model_id_val = row.get('model_id')
+                if not model_id_val:
+                    raise HTTPException(status_code=400, detail="model_id 不能为空")
                 rows.append({
-                    'model_id': int(row.get('model_id') or 1),
+                    'model_id': int(model_id_val),
                     'intent_id': (row.get('intent_id') or '').strip(),
-                    'text': text
+                    'text': text,
+                    'type': int(row.get('type') or 1)  # 缺省默认为 1（具体问法）
                 })
 
         if not rows:
@@ -391,11 +398,12 @@ async def upload_csv(file: UploadFile = File(...)):
                 model_ids = [r['model_id'] for r in batch]
                 intent_ids = [r['intent_id'] for r in batch]
                 text_list = [r['text'] for r in batch]
+                types = [r['type'] for r in batch]
                 is_actives = [True] * len(batch)
                 dense_vecs = [encoded['dense_vecs'][j].tolist() for j in range(len(batch))]
                 sparse_vecs = [encoded['lexical_weights'][j] for j in range(len(batch))]
 
-                entities = [model_ids, intent_ids, text_list, is_actives, dense_vecs, sparse_vecs]
+                entities = [model_ids, intent_ids, text_list, types, is_actives, dense_vecs, sparse_vecs]
                 HyBridSearch.collection.insert(entities)
 
                 success_count += len(batch)
@@ -432,8 +440,9 @@ async def upload_csv(file: UploadFile = File(...)):
 
 @app.get("/list")
 async def list_data(
-        model_id: int = 1,
+        model_id: int,
         intent_id: Optional[str] = None,
+        type: Optional[int] = None,
         is_active: Optional[bool] = True,
         page: int = 1,
         page_size: int = 20
@@ -448,6 +457,8 @@ async def list_data(
         expr_parts = [f"model_id == {model_id}"]
         if intent_id is not None:
             expr_parts.append(f'intent_id == "{intent_id}"')
+        if type is not None:
+            expr_parts.append(f"type == {type}")
         if is_active is not None:
             expr_parts.append(f"is_active == {'true' if is_active else 'false'}")
         expr = " and ".join(expr_parts)
@@ -459,7 +470,7 @@ async def list_data(
         def _query_page():
             return HyBridSearch.collection.query(
                 expr=expr,
-                output_fields=["id", "model_id", "intent_id", "text"],
+                output_fields=["id", "model_id", "intent_id", "text", "type"],
                 limit=page_size,
                 offset=offset
             )
@@ -482,7 +493,8 @@ async def list_data(
                 "id": r["id"],
                 "model_id": r["model_id"],
                 "intent_id": r["intent_id"],
-                "text": r["text"]
+                "text": r["text"],
+                "type": r["type"]
             }
             for r in results
         ]
@@ -651,9 +663,12 @@ async def callback(req: CallbackRequest):
 RECOGNIZE_TOP_K = 4
 
 
-async def fetch_intent_from_vector_db(text: str, cache_key: str) -> str:
+async def fetch_intent_from_vector_db(text: str, cache_key: str, model_id: int, type_threshold: int) -> str:
     """两阶段检索：Milvus 召回 + Reranker 精排"""
     total_start = time.perf_counter()
+
+    # 根据文本字数与阈值决定查询类型
+    query_type = 0 if len(text) <= type_threshold else 1
 
     # ---- Phase 1: 编码文本 ----
     t1 = time.perf_counter()
@@ -664,15 +679,16 @@ async def fetch_intent_from_vector_db(text: str, cache_key: str) -> str:
 
     # ---- Phase 2: 构建混合检索请求 (放大召回) ----
     recall_limit = max(20, RECOGNIZE_TOP_K * 2)
+    search_expr = f"is_active == true and model_id == {model_id} and type == {query_type}"
     req_dense = AnnSearchRequest(
         data=query_dense, anns_field="dense_vector",
         param={"metric_type": "COSINE", "params": {"ef": 64}},
-        limit=recall_limit, expr="is_active == true"
+        limit=recall_limit, expr=search_expr
     )
     req_sparse = AnnSearchRequest(
         data=query_sparse, anns_field="sparse_vector",
         param={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}},
-        limit=recall_limit, expr="is_active == true"
+        limit=recall_limit, expr=search_expr
     )
 
     # ---- Phase 3: Milvus 粗排 ----
@@ -720,7 +736,7 @@ async def fetch_intent_from_vector_db(text: str, cache_key: str) -> str:
 
     total_cost = (time.perf_counter() - total_start) * 1000
     logger.info(
-        f"[VectorDB] 识别完成: text='{text}' | "
+        f"[VectorDB] 识别完成: text='{text}' | query_type={query_type} | "
         f"命中意图: {intent_id}, Prob={top_prob:.4f} | "
         f"编码={t1_cost:.1f}ms, 粗排={t3_cost:.1f}ms, 精排={t4_cost:.1f}ms, 总耗时={total_cost:.1f}ms"
     )
@@ -767,7 +783,9 @@ async def recognize_intent(request: IntentRequest):
                 hot_key_selector,
                 fetch_intent_from_vector_db,
                 clean_text,
-                hot_key_selector
+                hot_key_selector,
+                request.model_id,
+                request.type_threshold
             )
         except Exception as e:
             logger.error(f"[Error] 向量检索失败: {e}")

@@ -14,6 +14,8 @@ fields = [
     FieldSchema(name="model_id", dtype=DataType.INT32),
     # 意图ID：同一意图下的多条语料共享相同 intent_id
     FieldSchema(name="intent_id", dtype=DataType.INT32),
+    # 语料类型 (0=关键字, 1=具体问法)
+    FieldSchema(name="type", dtype=DataType.INT32),
     # 语料文本（扩展到 500 字符）
     FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=500),
     # 是否启用（支持软删除）

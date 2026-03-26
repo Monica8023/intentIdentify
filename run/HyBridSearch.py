@@ -128,8 +128,9 @@ class DynamicBatcher:
 class InsertItem(BaseModel):
     """单条意图语料"""
     text: str
-    intent_id: Optional[int] = Field(default=1, alias="intentId")
-    model_id: Optional[int] = Field(default=1, alias="modelId")
+    intent_id: int = Field(alias="intentId")
+    model_id: int = Field(alias="modelId")
+    type: int
     active: bool = True
 
     @validator('text')
@@ -157,7 +158,7 @@ class BatchInsertRequest(BaseModel):
 class DeleteRequest(BaseModel):
     """根据 intent_id 批量删除"""
     intent_ids: List[int]
-    model_id: Optional[int] = Field(default=1, alias="modelId")
+    model_id: int = Field(alias="modelId")
 
     @validator('intent_ids')
     def ids_not_empty(cls, v):
@@ -172,7 +173,8 @@ class UpdateItem(BaseModel):
     """单个意图的更新数据：指定 intent_id + 新的 texts 列表"""
     intent_id: int
     texts: List[str]
-    model_id: Optional[int] = Field(default=1, alias="modelId")
+    model_id: int = Field(alias="modelId")
+    type: int
     active: bool = True
 
     @validator('intent_id')
@@ -204,7 +206,7 @@ class BatchUpdateRequest(BaseModel):
 # --- 混合检索 ---
 class CompareRequest(BaseModel):
     text: str
-    model_id: Optional[int] = Field(default=1, alias="modelId")
+    model_id: int = Field(alias="modelId")
     top_k: Optional[int] = Field(default=4, alias="topK")
 
     @validator('text')
@@ -282,6 +284,7 @@ def init_components():
             FieldSchema(name="model_id", dtype=DataType.INT32),
             FieldSchema(name="intent_id", dtype=DataType.INT32),
             FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=500),
+            FieldSchema(name="type", dtype=DataType.INT32),
             FieldSchema(name="is_active", dtype=DataType.BOOL),
             FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=DIM),
             FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR)
