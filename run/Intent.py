@@ -159,8 +159,9 @@ async def insert_data(req: BatchInsertRequest):
         total_cost = (time.perf_counter() - total_start) * 1000
         logger.info(f"[新增] 批量写入 {len(items)} 条, 编码={encode_cost:.1f}ms, 总耗时={total_cost:.1f}ms")
         return {
-            "code": 200, "msg": "success", "inserted_count": len(res.primary_keys),
-            "inserted_ids": list(res.primary_keys), "time_cost_ms": round(total_cost, 2)
+            "code": 200,
+            "msg": "success",
+            "data": True
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"批量写入 Milvus 失败: {str(e)}")
@@ -218,9 +219,7 @@ async def delete_data(req: DeleteRequest):
         return {
             "code": 200,
             "msg": "success",
-            "deleted_count": deleted_count,
-            "intent_ids": req.intent_ids,
-            "time_cost_ms": round(total_cost, 2)
+            "data": True
         }
     except Exception as e:
         logger.error(f"[删除失败] {e}", exc_info=True)
@@ -231,37 +230,47 @@ async def delete_data(req: DeleteRequest):
 async def update_data(req: BatchUpdateRequest):
     """
     批量更新意图语料（先删后增）。
-    对指定的 intent_id 进行逻辑删除：先通过 ID 查出 is_active=True 的全量原数据，将其
-    以 is_active=False 的状态重新入库，并物理删除原有 ID。然后再插入更新的新 texts。
+    Java 侧传入 List<MilvusIntentDTO>，每条包含 intentId/modelId/type/text。
+    按 (intentId, modelId, type) 分组聚合后：
+      1. 对每组先逻辑删除该 (intentId, modelId) 下所有活跃记录
+      2. 再将聚合后的新 texts 插入
     """
     try:
         total_start = time.perf_counter()
+
+        # 按 (intent_id, model_id, type) 分组聚合 texts
+        from collections import defaultdict
+        groups = defaultdict(lambda: {"texts": [], "active": True})
+        for item in req.items:
+            key = (item.intent_id, item.model_id, item.type)
+            groups[key]["texts"].append(item.text)
+            groups[key]["active"] = item.active
 
         results = []
         total_deleted = 0
         total_inserted = 0
 
-        for item in req.items:
+        for (intent_id, model_id, item_type), group in groups.items():
             item_result = {
-                "intent_id": item.intent_id,
-                "deleted": 0,  # 这里的 deleted 是指逻辑删除的数量
+                "intent_id": intent_id,
+                "model_id": model_id,
+                "type": item_type,
+                "deleted": 0,
                 "inserted": 0,
                 "status": "success"
             }
             try:
-                # === Step 1: 逻辑删除该 intent_id 下的原有活跃记录 ===
-                expr = f'intent_id == "{item.intent_id}" and is_active == true and model_id == {item.model_id}'
+                # === Step 1: 逻辑删除该 intent_id+model_id 下的原有活跃记录 ===
+                expr = f"intent_id == {intent_id} and is_active == true and model_id == {model_id}"
                 qs = HyBridSearch.collection.query(
                     expr=expr,
                     output_fields=["id", "model_id", "intent_id", "text", "type", "dense_vector", "sparse_vector"],
                     limit=16384
                 )
                 if qs:
-                    # 1.1 依据主键(PK)物理删除存量活跃记录
                     pks = [str(r["id"]) for r in qs]
                     HyBridSearch.collection.delete(expr=f"id in [{', '.join(pks)}]")
 
-                    # 1.2 以 is_active=False 重新插入实现逻辑删除
                     ins_models = [r["model_id"] for r in qs]
                     ins_intents = [r["intent_id"] for r in qs]
                     ins_texts = [r["text"] for r in qs]
@@ -277,43 +286,43 @@ async def update_data(req: BatchUpdateRequest):
                     item_result["deleted"] = len(qs)
                     total_deleted += len(qs)
 
-                # === Step 2: 编码新的 texts 并插入新配置 ===
+                # === Step 2: 编码新的 texts 并插入 ===
+                texts_to_insert = group["texts"]
                 t_encode = time.perf_counter()
                 encoded = HyBridSearch.bge_model.encode(
-                    item.texts, return_dense=True, return_sparse=True
+                    texts_to_insert, return_dense=True, return_sparse=True
                 )
                 encode_cost = (time.perf_counter() - t_encode) * 1000
 
-                n = len(item.texts)
-                model_ids = [item.model_id] * n
-                intent_ids = [item.intent_id] * n
-                text_list = list(item.texts)
-                types = [item.type] * n
-                is_actives = [item.active] * n
-                dense_vecs = [encoded['dense_vecs'][j].tolist() for j in range(n)]
-                sparse_vecs = [encoded['lexical_weights'][j] for j in range(n)]
-
-                entities = [model_ids, intent_ids, text_list, types, is_actives, dense_vecs, sparse_vecs]
+                n = len(texts_to_insert)
+                entities = [
+                    [model_id] * n,
+                    [intent_id] * n,
+                    texts_to_insert,
+                    [item_type] * n,
+                    [group["active"]] * n,
+                    [encoded['dense_vecs'][j].tolist() for j in range(n)],
+                    [encoded['lexical_weights'][j] for j in range(n)],
+                ]
                 res = HyBridSearch.collection.insert(entities)
 
                 item_result["inserted"] = len(res.primary_keys)
                 total_inserted += len(res.primary_keys)
 
                 logger.info(
-                    f"[更新] intent_id={item.intent_id}: "
-                    f"逻辑删除的旧记录数 {item_result['deleted']}, "
-                    f"新增记录数 {item_result['inserted']}, "
-                    f"新记录编码耗时 {encode_cost:.1f}ms"
+                    f"[更新] intent_id={intent_id} model_id={model_id} type={item_type}: "
+                    f"逻辑删除旧记录={item_result['deleted']}, "
+                    f"新增={item_result['inserted']}, 编码耗时={encode_cost:.1f}ms"
                 )
             except Exception as e:
                 item_result["status"] = f"failed: {str(e)}"
-                logger.error(f"[更新] intent_id={item.intent_id} 失败: {e}", exc_info=True)
+                logger.error(f"[更新] intent_id={intent_id} 失败: {e}", exc_info=True)
 
             results.append(item_result)
 
         total_cost = (time.perf_counter() - total_start) * 1000
         logger.info(
-            f"[更新] 批量完成: 处理 {len(req.items)} 个意图, "
+            f"[更新] 批量完成: 处理 {len(groups)} 个意图组, "
             f"逻辑删除原记录总计={total_deleted}, 新增记录总计={total_inserted}, "
             f"总耗时={total_cost:.1f}ms"
         )
@@ -321,10 +330,7 @@ async def update_data(req: BatchUpdateRequest):
         return {
             "code": 200,
             "msg": "success",
-            "total_deleted": total_deleted,
-            "total_inserted": total_inserted,
-            "details": results,
-            "time_cost_ms": round(total_cost, 2)
+            "data": True
         }
     except Exception as e:
         logger.error(f"[更新失败] {e}", exc_info=True)
@@ -370,7 +376,7 @@ async def upload_csv(file: UploadFile = File(...)):
                     raise HTTPException(status_code=400, detail="model_id 不能为空")
                 rows.append({
                     'model_id': int(model_id_val),
-                    'intent_id': (row.get('intent_id') or '').strip(),
+                    'intent_id': int(row.get('intent_id')),
                     'text': text,
                     'type': int(row.get('type') or 1)  # 缺省默认为 1（具体问法）
                 })
@@ -660,7 +666,7 @@ async def callback(req: CallbackRequest):
 
 # ================= 意图识别（生产接口）=================
 
-RECOGNIZE_TOP_K = 4
+RECOGNIZE_TOP_K = 2
 
 
 async def fetch_intent_from_vector_db(text: str, cache_key: str, model_id: int, type_threshold: int) -> str:
@@ -730,7 +736,7 @@ async def fetch_intent_from_vector_db(text: str, cache_key: str, model_id: int, 
 
     if len(reranked_results) > 1:
         gap = top_prob - reranked_results[1]["probability"]
-        if gap < 0.1:
+        if gap < _cfg.high_gap_threshold:
             logger.warning(
                 f"[VectorDB] 意图模糊(Gap={gap:.4f}): text='{text}' | Top1={intent_id}, Top2={reranked_results[1]['intent_id']}")
 
@@ -775,7 +781,7 @@ async def recognize_intent(request: IntentRequest):
     # 根据当前节点id查询热键  命中直接返回 未命中走向量匹配
     hot_key_selector = f"dolphin:intent:match:{current_node_id}:{clean_text}"
     intent_id = await redis_client.get(hot_key_selector)
-    logger.info(f"是否匹配到热数据 -> {not intent_id} 当前intent_id:{intent_id}")
+    logger.info(f"是否匹配到热数据 -> {intent_id} 当前intent_id:{intent_id}")
 
     if not intent_id:
         try:

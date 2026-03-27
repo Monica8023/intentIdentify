@@ -125,13 +125,16 @@ class DynamicBatcher:
 # ================= 5. Pydantic 数据模型（含校验）=================
 
 # --- 新增 / 批量新增 ---
+# Java 侧传入 List<MilvusIntentDTO>，每条包含 intentId/modelId/type/text/active
 class InsertItem(BaseModel):
-    """单条意图语料"""
-    text: str
+    """单条意图语料（与 Java MilvusIntentDTO 字段对齐）"""
     intent_id: int = Field(alias="intentId")
     model_id: int = Field(alias="modelId")
     type: int
+    text: str
     active: bool = True
+
+    model_config = ConfigDict(populate_by_name=True)
 
     @validator('text')
     def text_must_not_be_empty(cls, v):
@@ -155,46 +158,26 @@ class BatchInsertRequest(BaseModel):
 
 
 # --- 批量删除 ---
+# Java 侧传入 MilvusIntentDelDTO：intentIds(List<Integer>) + modelId
 class DeleteRequest(BaseModel):
-    """根据 intent_id 批量删除"""
-    intent_ids: List[int]
+    """根据 intent_id 批量删除（与 Java MilvusIntentDelDTO 字段对齐）"""
+    intent_ids: List[int] = Field(alias="intentIds")
     model_id: int = Field(alias="modelId")
+
+    model_config = ConfigDict(populate_by_name=True)
 
     @validator('intent_ids')
     def ids_not_empty(cls, v):
-        v = [x for x in v]
         if not v:
             raise ValueError('intent_ids 不能为空')
         return v
 
 
 # --- 批量更新（先删后增）---
-class UpdateItem(BaseModel):
-    """单个意图的更新数据：指定 intent_id + 新的 texts 列表"""
-    intent_id: int
-    texts: List[str]
-    model_id: int = Field(alias="modelId")
-    type: int
-    active: bool = True
-
-    @validator('intent_id')
-    def id_not_empty(cls, v):
-        v = v.strip()
-        if not v:
-            raise ValueError('intent_id 不能为空')
-        return v
-
-    @validator('texts')
-    def texts_not_empty(cls, v):
-        v = [t.strip() for t in v if t.strip()]
-        if not v:
-            raise ValueError('texts 不能为空')
-        return v
-
-
+# Java 侧传入 List<MilvusIntentDTO>，每条一个 text，按 intentId 分组聚合后先删后增
 class BatchUpdateRequest(BaseModel):
-    """批量更新请求"""
-    items: List[UpdateItem]
+    """批量更新请求（与 Java MilvusIntentDTO 列表对齐，每条一个 text）"""
+    items: List[InsertItem]
 
     @validator('items')
     def items_not_empty(cls, v):
@@ -265,12 +248,12 @@ def init_components():
 
     # 1. 加载模型
     logger.info("正在加载 bge-m3 embedding 模型...")
-    bge_model = BGEM3FlagModel(_cfg.model_path, use_fp16=True)
+    bge_model = BGEM3FlagModel(_cfg.model_path, use_fp16=True, devices="cuda:0")
     logger.info("Embedding 模型加载完成")
 
     # 2. 加载 bge-reranker-v2-m3 模型
     logger.info("正在加载 bge-reranker-v2-m3 重排模型...")
-    reranker_model = FlagReranker(_cfg.reranker_model_path, use_fp16=True)
+    reranker_model = FlagReranker(_cfg.reranker_model_path, use_fp16=True, devices="cuda:0")
     logger.info("重排模型加载完成")
 
     # 3. 连接 Milvus
