@@ -96,7 +96,8 @@ class IntentRequest(BaseModel):
     text: str
     call_id: str
     model_id: int
-    type_threshold: int
+    word_count: Optional[int] = Field(default=None, description="字数阈值，不传时跳过短文本拦截直接走相似度匹配")
+    question_similarity: float = Field(default=0.0, description="问法相似度阈值，覆盖 low_score_threshold 做置信度拦截，0.0 表示使用全局配置")
 
 
 class IntentResponse(BaseModel):
@@ -669,21 +670,12 @@ async def callback(req: CallbackRequest):
 RECOGNIZE_TOP_K = 2
 
 
-async def fetch_intent_from_vector_db(text: str, cache_key: str, model_id: int, type_threshold: int) -> str:
-    """两阶段检索：Milvus 召回 + Reranker 精排"""
-    total_start = time.perf_counter()
-
-    # 根据文本字数与阈值决定查询类型
-    query_type = 0 if len(text) <= type_threshold else 1
-
-    # ---- Phase 1: 编码文本 ----
-    t1 = time.perf_counter()
+async def _vector_search(text: str, model_id: int, query_type: int) -> list:
+    """Milvus 混合检索 + Reranker 精排，返回排序后的候选列表"""
     encoded = await HyBridSearch.batcher.encode(text)
     query_dense = [encoded['dense_vec']]
     query_sparse = [encoded['sparse_vec']]
-    t1_cost = (time.perf_counter() - t1) * 1000
 
-    # ---- Phase 2: 构建混合检索请求 (放大召回) ----
     recall_limit = max(20, RECOGNIZE_TOP_K * 2)
     search_expr = f"is_active == true and model_id == {model_id} and type == {query_type}"
     req_dense = AnnSearchRequest(
@@ -697,13 +689,10 @@ async def fetch_intent_from_vector_db(text: str, cache_key: str, model_id: int, 
         limit=recall_limit, expr=search_expr
     )
 
-    # ---- Phase 3: Milvus 粗排 ----
-    t3 = time.perf_counter()
     results = HyBridSearch.collection.hybrid_search(
         reqs=[req_dense, req_sparse], rerank=RRFRanker(),
         limit=recall_limit, output_fields=["text", "intent_id"]
     )
-    t3_cost = (time.perf_counter() - t3) * 1000
 
     candidates = []
     if results and results[0]:
@@ -714,41 +703,69 @@ async def fetch_intent_from_vector_db(text: str, cache_key: str, model_id: int, 
             })
 
     if not candidates:
+        return []
+
+    return await HyBridSearch.async_rerank_candidates(text, candidates)
+
+
+async def fetch_intent_from_vector_db(
+    text: str, cache_key: str, model_id: int,
+    word_count: Optional[int], question_similarity: float
+) -> str:
+    """
+    意图识别主流程：
+    - word_count 为 None：跳过关键字匹配和短文本拦截，直接走向量相似度匹配
+    - 短文本（len <= word_count）：仅 Redis 关键字匹配，未命中直接返回 intent_unknown
+    - 长文本（len > word_count） ：先 Redis 关键字匹配，未命中再走向量相似度匹配
+    置信度阈值优先使用请求参数 question_similarity，为 0.0 时回退到全局 low_score_threshold
+    """
+    total_start = time.perf_counter()
+    score_threshold = question_similarity if question_similarity > 0.0 else _cfg.low_score_threshold
+
+    # ---- word_count 有值时走关键字匹配分支 ----
+    if word_count is not None:
+        is_short = len(text) <= word_count
+
+        # Phase 1: Redis 关键字精确匹配（短文本和长文本都走）
+        # key 格式：dolphin:intent:keyword:{model_id}:{text}
+        keyword_key = f"dolphin:intent:keyword:{model_id}:{text}"
+        keyword_intent = await redis_client.get(keyword_key)
+        if keyword_intent:
+            logger.info(f"[Keyword] 关键字命中: text='{text}' → intent_id={keyword_intent}")
+            return str(keyword_intent)
+
+        # 短文本：关键字未命中直接返回未知
+        if is_short:
+            logger.info(f"[Keyword] 短文本未命中关键字，直接返回 intent_unknown: text='{text}'")
+            return "intent_unknown"
+
+    # ---- 向量相似度匹配（长文本 或 word_count 未传）----
+    t_vec = time.perf_counter()
+    reranked_results = await _vector_search(text, model_id, query_type=1)
+    vec_cost = (time.perf_counter() - t_vec) * 1000
+
+    if not reranked_results:
         logger.warning(f"[VectorDB] 粗排未找到任何候选: text='{text}'")
         return "intent_unknown"
 
-    # ---- Phase 4: Reranker 精排 ----
-    t4 = time.perf_counter()
-    reranked_results = await HyBridSearch.async_rerank_candidates(text, candidates)
-    t4_cost = (time.perf_counter() - t4) * 1000
-
-    # ---- Phase 5: 置信度拦截与提取 ----
     top_hit = reranked_results[0]
     top_prob = top_hit["probability"]
     intent_id = top_hit["intent_id"]
 
-    if top_prob < _cfg.low_score_threshold:
+    # ---- 置信度拦截 ----
+    if top_prob < score_threshold:
         logger.warning(
-            f"[VectorDB] 置信度拦截(低于{_cfg.low_score_threshold}): text='{text}' | "
-            f"Top1={intent_id}, Prob={top_prob}"
+            f"[VectorDB] 置信度拦截(低于{score_threshold}): text='{text}' | "
+            f"Top1={intent_id}, Prob={top_prob:.4f}"
         )
         return "intent_unknown"
 
-    if len(reranked_results) > 1:
-        gap = top_prob - reranked_results[1]["probability"]
-        if gap < _cfg.high_gap_threshold:
-            logger.warning(
-                f"[VectorDB] 意图模糊(Gap={gap:.4f}): text='{text}' | Top1={intent_id}, Top2={reranked_results[1]['intent_id']}")
-
     total_cost = (time.perf_counter() - total_start) * 1000
     logger.info(
-        f"[VectorDB] 识别完成: text='{text}' | query_type={query_type} | "
-        f"命中意图: {intent_id}, Prob={top_prob:.4f} | "
-        f"编码={t1_cost:.1f}ms, 粗排={t3_cost:.1f}ms, 精排={t4_cost:.1f}ms, 总耗时={total_cost:.1f}ms"
+        f"[VectorDB] 识别完成: text='{text}' | word_count={word_count} | "
+        f"命中意图: {intent_id}, Prob={top_prob:.4f}, 阈值={score_threshold} | "
+        f"向量耗时={vec_cost:.1f}ms, 总耗时={total_cost:.1f}ms"
     )
-
-    # 写入缓存（后台，不阻塞返回）
-    # asyncio.ensure_future(set_cache_background(cache_key, intent_id))
 
     return str(intent_id)
 
@@ -791,7 +808,8 @@ async def recognize_intent(request: IntentRequest):
                 clean_text,
                 hot_key_selector,
                 request.model_id,
-                request.type_threshold
+                request.word_count,
+                request.question_similarity
             )
         except Exception as e:
             logger.error(f"[Error] 向量检索失败: {e}")
