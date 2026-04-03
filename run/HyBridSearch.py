@@ -232,10 +232,18 @@ async def async_rerank_candidates(query: str, candidates: List[dict]) -> List[di
     if isinstance(scores, float):
         scores = [scores]
 
-    # 将分数回填并计算概率
+    # ① 回填 raw_score + raw_confidence（绝对置信度，适合做低置信阈值）
     for i, item in enumerate(candidates):
-        item["rerank_raw_score"] = scores[i]
-        item["probability"] = round(_sigmoid(scores[i]), 4)
+        raw_score = scores[i]
+        item["rerank_raw_score"] = raw_score
+        item["raw_confidence"] = round(_sigmoid(raw_score), 4)
+
+    # ② softmax 归一化（相对竞争分数，适合排序和 gap 判断）
+    max_s = max(scores)
+    exp_s = [math.exp(s - max_s) for s in scores]
+    total = sum(exp_s)
+    for i, item in enumerate(candidates):
+        item["probability"] = round(exp_s[i] / total, 4)
 
     # 降序排列
     sorted_candidates = sorted(candidates, key=lambda x: x["probability"], reverse=True)

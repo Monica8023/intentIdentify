@@ -5,7 +5,7 @@ Intent — AI 意图识别微服务（唯一服务入口）
   - GET  /health           健康检查
   - GET  /ready            就绪检查
   - POST /insert           批量写入意图语料
-  - POST /delete           根据 intent_id 批量删除
+  - DELETE /delete           根据 intent_id 批量删除
   - POST /update           批量更新（先删后增）
   - POST /upload           CSV 批量导入语料
   - POST /compare          混合检索+精排（调试/测试用）
@@ -168,7 +168,7 @@ async def insert_data(req: BatchInsertRequest):
         raise HTTPException(status_code=500, detail=f"批量写入 Milvus 失败: {str(e)}")
 
 
-@app.post("/delete")
+@app.delete("/delete")
 async def delete_data(req: DeleteRequest):
     """根据 intent_id 批量逻辑删除意图语料"""
     try:
@@ -591,13 +591,15 @@ async def compare_data(req: CompareRequest):
         debug_gap = None
 
         if len(final_matches) > 0:
+            top1_conf = final_matches[0].get("raw_confidence", 0.0)
             top1_prob = final_matches[0]["probability"]
 
-            if top1_prob < _cfg.low_score_threshold:
+            # 低置信判断使用绝对置信度，避免 softmax 相对概率误伤
+            if top1_conf < _cfg.low_score_threshold:
                 confidence_status = "LOW_CONFIDENCE"
             elif len(final_matches) > 1:
                 top2_prob = final_matches[1]["probability"]
-                # 计算概率断层差值
+                # 断层判断继续使用相对概率差值
                 debug_gap = round(top1_prob - top2_prob, 4)
 
                 if debug_gap >= _cfg.high_gap_threshold:
@@ -724,7 +726,7 @@ async def fetch_intent_from_vector_db(
 
     # ---- word_count 有值时走关键字匹配分支 ----
     if word_count is not None:
-        is_short = len(text) <= word_count
+        is_short = len(text) < word_count
 
         # Phase 1: Redis 关键字精确匹配（短文本和长文本都走）
         # key 格式：dolphin:intent:keyword:{model_id}:{text}
@@ -748,22 +750,37 @@ async def fetch_intent_from_vector_db(
         logger.warning(f"[VectorDB] 粗排未找到任何候选: text='{text}'")
         return "intent_unknown"
 
+    final_matches = reranked_results[:4]
+
+    debug_gap = None
     top_hit = reranked_results[0]
-    top_prob = top_hit["probability"]
+    top_conf = top_hit.get("raw_confidence", 0.0)
     intent_id = top_hit["intent_id"]
 
-    # ---- 置信度拦截 ----
-    if top_prob < score_threshold:
-        logger.warning(
-            f"[VectorDB] 置信度拦截(低于{score_threshold}): text='{text}' | "
-            f"Top1={intent_id}, Prob={top_prob:.4f}"
-        )
-        return "intent_unknown"
+    if len(final_matches) > 0:
+        top1_prob = final_matches[0]["probability"]
+
+        # 低置信判断使用绝对置信度，避免 softmax 相对概率误伤
+        if top_conf < score_threshold:
+            logger.warning(
+                f"[VectorDB] 置信度拦截(低于{score_threshold}): text='{text}' | "
+                f"Top1={intent_id}, conf={top_conf:.4f}"
+            )
+            return "intent_unknown"
+        elif len(final_matches) > 1:
+            top2_prob = final_matches[1]["probability"]
+            # 断层判断继续使用相对概率差值
+            debug_gap = round(top1_prob - top2_prob, 4)
+
+            if debug_gap >= _cfg.high_gap_threshold:
+                return str(intent_id)
+        else:
+            return str(intent_id)
 
     total_cost = (time.perf_counter() - total_start) * 1000
     logger.info(
         f"[VectorDB] 识别完成: text='{text}' | word_count={word_count} | "
-        f"命中意图: {intent_id}, Prob={top_prob:.4f}, 阈值={score_threshold} | "
+        f"命中意图: {intent_id}, confidence={top_conf:.4f}, 阈值={score_threshold} | "
         f"向量耗时={vec_cost:.1f}ms, 总耗时={total_cost:.1f}ms"
     )
 
