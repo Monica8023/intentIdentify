@@ -5,7 +5,7 @@ Intent — AI 意图识别微服务（唯一服务入口）
   - GET  /health           健康检查
   - GET  /ready            就绪检查
   - POST /insert           批量写入意图语料
-  - DELETE /delete           根据 intent_id 批量删除
+  - POST /delete           根据 intent_id 批量删除
   - POST /update           批量更新（先删后增）
   - POST /upload           CSV 批量导入语料
   - POST /compare          混合检索+精排（调试/测试用）
@@ -168,7 +168,7 @@ async def insert_data(req: BatchInsertRequest):
         raise HTTPException(status_code=500, detail=f"批量写入 Milvus 失败: {str(e)}")
 
 
-@app.delete("/delete")
+@app.post("/delete")
 async def delete_data(req: DeleteRequest):
     """根据 intent_id 批量逻辑删除意图语料"""
     try:
@@ -813,8 +813,9 @@ async def recognize_intent(request: IntentRequest):
     logger.info(f"当前节点id:{current_node_id}  查询key:{current_node_key}")
 
     # 根据当前节点id查询热键  命中直接返回 未命中走向量匹配
-    hot_key_selector = f"dolphin:intent:match:{current_node_id}:{clean_text}"
-    intent_id = await redis_client.get(hot_key_selector)
+    hot_key_selector = f"ai_model_node:{current_node_id}:ki_map"
+    hash_key = f"k:{clean_text}"
+    intent_id = await redis_client.hget(hot_key_selector, hash_key)
     logger.info(f"是否匹配到热数据 -> {intent_id} 当前intent_id:{intent_id}")
 
     if not intent_id:
