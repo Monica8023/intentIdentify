@@ -100,10 +100,6 @@ def _apply_yaml(content: str):
 
 
 async def init_config(
-    nacos_server: str = "nacos.register.service.com:8848",
-    nacos_namespace: str = "intent_test",
-    nacos_data_id: str = "intent-server-dev.yaml",
-    nacos_group: str = "dolphin",
     poll_interval_s: int = 30,
 ) -> None:
     """
@@ -111,10 +107,30 @@ async def init_config(
     - NACOS_DISABLED=true → 仅用内置默认值，不连 Nacos
     - 否则从 Nacos 拉取初始配置，注册 async 热更新监听，并启动轮询兜底
     兼容 nacos-sdk-python 3.x（包路径 v2.nacos，全异步 API）
+
+    连接参数全部从环境变量读取：
+      NACOS_SERVER_ADDR   默认 nacos.register.service.com:8848
+      NACOS_NAMESPACE     默认 intent_test
+      NACOS_DATA_ID       默认 intent-server-dev.yaml
+      NACOS_GROUP         默认 dolphin
+      NACOS_USERNAME      可选
+      NACOS_PASSWORD      可选
     """
     if os.environ.get("NACOS_DISABLED", "").lower() == "true":
         logger.info("[Config] NACOS_DISABLED=true，使用默认配置")
         return
+
+    nacos_server = os.environ.get("NACOS_SERVER_ADDR", "nacos.register.service.com:8848")
+    nacos_namespace = os.environ.get("NACOS_NAMESPACE", "intent_test")
+    nacos_data_id = os.environ.get("NACOS_DATA_ID", "intent-server-dev.yaml")
+    nacos_group = os.environ.get("NACOS_GROUP", "dolphin")
+    nacos_username = os.environ.get("NACOS_USERNAME", "")
+    nacos_password = os.environ.get("NACOS_PASSWORD", "")
+
+    logger.info(
+        f"[Config] Nacos 连接参数: server={nacos_server} namespace={nacos_namespace} "
+        f"data_id={nacos_data_id} group={nacos_group}"
+    )
 
     try:
         from v2.nacos import NacosConfigService, ClientConfigBuilder, ConfigParam  # type: ignore
@@ -123,12 +139,14 @@ async def init_config(
         return
 
     try:
-        client_config = (
+        builder = (
             ClientConfigBuilder()
             .server_address(nacos_server)
             .namespace_id(nacos_namespace)
-            .build()
         )
+        if nacos_username:
+            builder = builder.username(nacos_username).password(nacos_password)
+        client_config = builder.build()
         client_config.disable_use_config_cache = True
 
         svc = await NacosConfigService.create_config_service(client_config)
@@ -141,12 +159,13 @@ async def init_config(
         else:
             logger.warning("[Config] Nacos 返回空配置，使用默认值")
 
-        # 注册 async 热更新监听（与 dolphin-asr 保持一致）
-        async def _on_change(tenant, nacos_data_id, nacos_group, content):
+        # 注册 async 热更新监听
+        # SDK 回调签名：(tenant, data_id, group, content)
+        async def _on_change(tenant, data_id, group, content):
             if not content:
                 return
             try:
-                logger.info(f"[Config] 收到 Nacos 配置变更，正在热更新... data_id={nacos_data_id}")
+                logger.info(f"[Config] 收到 Nacos 配置变更，正在热更新... data_id={data_id} group={group}")
                 _apply_yaml(content)
             except Exception as e:
                 logger.error(f"[Config] 热更新失败: {e}")

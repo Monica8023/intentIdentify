@@ -51,9 +51,9 @@ app = FastAPI(
     description="基于 bge-m3 混合检索与 bge-reranker-v2-m3 精排的意图识别服务"
 )
 
-# --- Redis 异步连接池 ---
-redis_pool = redis.ConnectionPool.from_url(_cfg.redis_url, decode_responses=True)
-redis_client = redis.Redis(connection_pool=redis_pool)
+# --- Redis 异步连接池（在 startup 完成 Nacos 加载后初始化）---
+redis_pool: redis.ConnectionPool = None  # type: ignore[assignment]
+redis_client: redis.Redis = None  # type: ignore[assignment]
 
 
 # --- 并发控制：Singleflight (请求合并机制) ---
@@ -109,8 +109,12 @@ class IntentResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
+    global redis_pool, redis_client
     logger.info("[启动] 正在初始化 Nacos 配置...")
     await NacosConfig.init_config()
+    logger.info(f"[启动] 使用 Redis: {_cfg.redis_url}")
+    redis_pool = redis.ConnectionPool.from_url(_cfg.redis_url, decode_responses=True)
+    redis_client = redis.Redis(connection_pool=redis_pool)
     logger.info("[启动] 正在初始化 HyBridSearch 组件（模型 + Milvus + 批处理器 + 重排器）...")
     HyBridSearch.init_components()
     logger.info("[启动] 所有组件初始化完成，服务就绪")
@@ -168,7 +172,7 @@ async def insert_data(req: BatchInsertRequest):
         raise HTTPException(status_code=500, detail=f"批量写入 Milvus 失败: {str(e)}")
 
 
-@app.post("/delete")
+@app.delete("/delete")
 async def delete_data(req: DeleteRequest):
     """根据 intent_id 批量逻辑删除意图语料"""
     try:
@@ -712,30 +716,29 @@ async def _vector_search(text: str, model_id: int, query_type: int) -> list:
 
 async def fetch_intent_from_vector_db(
     text: str, cache_key: str, model_id: int,
-    word_count: Optional[int], question_similarity: float
+    word_count: Optional[int], question_similarity: float, node_id: int
 ) -> str:
     """
-    意图识别主流程：
-    - word_count 为 None：跳过关键字匹配和短文本拦截，直接走向量相似度匹配
-    - 短文本（len <= word_count）：仅 Redis 关键字匹配，未命中直接返回 intent_unknown
-    - 长文本（len > word_count） ：先 Redis 关键字匹配，未命中再走向量相似度匹配
+    意图识别主流程（始终先做热数据关键字匹配）：
+    1. Redis 热数据关键字精确匹配（始终执行，命中直接返回）
+    2. word_count 有值且文本偏短：关键字未命中则直接返回 intent_unknown
+    3. word_count 为 None 或文本足够长：走向量相似度匹配 + 精排置信度判断
     置信度阈值优先使用请求参数 question_similarity，为 0.0 时回退到全局 low_score_threshold
     """
     total_start = time.perf_counter()
     score_threshold = question_similarity if question_similarity > 0.0 else _cfg.low_score_threshold
 
-    # ---- word_count 有值时走关键字匹配分支 ----
+    # ---- Phase 1: Redis 热数据关键字精确匹配（始终执行）----
+    hot_key_selector = f"ai_model_node:{node_id}:ki_map"
+    hash_key = f"k:{text}"
+    keyword_intent = await redis_client.hget(hot_key_selector, hash_key)
+    if keyword_intent:
+        logger.info(f"[Keyword] 关键字命中: text='{text}' → intent_id={keyword_intent}")
+        return str(keyword_intent)
+
+    # ---- word_count 有值时走短文本拦截分支 ----
     if word_count is not None:
         is_short = len(text) < word_count
-
-        # Phase 1: Redis 关键字精确匹配（短文本和长文本都走）
-        # key 格式：dolphin:intent:keyword:{model_id}:{text}
-        keyword_key = f"dolphin:intent:keyword:{model_id}:{text}"
-        keyword_intent = await redis_client.get(keyword_key)
-        if keyword_intent:
-            logger.info(f"[Keyword] 关键字命中: text='{text}' → intent_id={keyword_intent}")
-            return str(keyword_intent)
-
         # 短文本：关键字未命中直接返回未知
         if is_short:
             logger.info(f"[Keyword] 短文本未命中关键字，直接返回 intent_unknown: text='{text}'")
@@ -812,26 +815,21 @@ async def recognize_intent(request: IntentRequest):
         raise HTTPException(status_code=400, detail="current  callId have not been set node id")
     logger.info(f"当前节点id:{current_node_id}  查询key:{current_node_key}")
 
-    # 根据当前节点id查询热键  命中直接返回 未命中走向量匹配
-    hot_key_selector = f"ai_model_node:{current_node_id}:ki_map"
-    hash_key = f"k:{clean_text}"
-    intent_id = await redis_client.hget(hot_key_selector, hash_key)
-    logger.info(f"是否匹配到热数据 -> {intent_id} 当前intent_id:{intent_id}")
-
-    if not intent_id:
-        try:
-            intent_id = await singleflight.do(
-                hot_key_selector,
-                fetch_intent_from_vector_db,
-                clean_text,
-                hot_key_selector,
-                request.model_id,
-                request.word_count,
-                request.question_similarity
-            )
-        except Exception as e:
-            logger.error(f"[Error] 向量检索失败: {e}")
-            intent_id = "intent_unknown"
+    singleflight_key = f"ai_model_node:{current_node_id}:ki_map"
+    try:
+        intent_id = await singleflight.do(
+            singleflight_key,
+            fetch_intent_from_vector_db,
+            clean_text,
+            singleflight_key,
+            request.model_id,
+            request.word_count,
+            request.question_similarity,
+            current_node_id
+        )
+    except Exception as e:
+        logger.error(f"[Error] 意图识别失败: {e}")
+        intent_id = "intent_unknown"
     logger.info(f"callId : {request.call_id} intentId : {intent_id}")
     return IntentResponse(
         intent_id=intent_id,
